@@ -1,243 +1,284 @@
-import { useState, Suspense, useEffect, useCallback, useLayoutEffect, lazy } from 'react';
-import { Canvas, useThree, useFrame, useLoader } from '@react-three/fiber';
-import { Preload, useTexture, Text, PerformanceMonitor } from '@react-three/drei';
-import * as THREE from 'three';
+import React, { useState, useEffect, useRef } from 'react';
+import Navbar from './components/shopping/Navbar';
+import Hero3D from './components/shopping/Hero3D';
+import ProductCatalog from './components/shopping/ProductCatalog';
+import ProductInspectorModal3D from './components/shopping/ProductInspectorModal3D';
+import CartDrawer from './components/shopping/CartDrawer';
+import CheckoutModal from './components/shopping/CheckoutModal';
+import WishlistDrawer from './components/shopping/WishlistDrawer';
+import GraphicsSettingsModal from './components/shopping/GraphicsSettingsModal';
+import Footer from './components/shopping/Footer';
+import productsData from './data/products.json';
+import { sounds } from './utils/soundEffects';
 
-import Preloader from './components/dom/Preloader';
-import PaperTransition from './components/dom/PaperTransition';
-import { AudioProvider, useAudio } from './context/AudioManager';
-import { initAudio } from './utils/audioManager';
-import { PerformanceProvider, usePerformance } from './context/PerformanceContext';
-import { SceneProvider, useScene } from './context/SceneContext';
-import { AchievementsProvider } from './context/AchievementsContext';
-import NavigationUI from './components/ui/NavigationUI';
-import GlobalOverlay from './components/ui/GlobalOverlay';
-import ScreenReaderOverlay from './components/ui/ScreenReaderOverlay';
-import ClassroomTaskOverlay from './components/ui/ClassroomTaskOverlay';
-import { useDocumentMeta } from './hooks/useDocumentMeta';
-import posthog from 'posthog-js';
-import { loadSanityData } from './hooks/useSanityData';
-
-// Initialize PostHog
-posthog.init(import.meta.env.VITE_POSTHOG_KEY, {
-  api_host: import.meta.env.VITE_POSTHOG_HOST,
-  person_profiles: 'identified_only', // or 'always' to create profiles for anonymous users as well
-});
-
-// Lazy load the heavy 3D experience
-const Experience = lazy(() => import('./components/canvas/Experience'));
-
-import './styles/main.scss';
-
-// --- CONDITIONAL ASSET PRELOADING ---
-// On high-end devices, preloads everything for zero stutter.
-// On mobile/low-end devices, only preloads core textures to prevent Out Of Memory crashes.
-import { 
-  ENTRANCE_TEXTURES, 
-  CORRIDOR_TEXTURES, 
-  UI_TEXTURES,
-  PRELOAD_ALL, 
-  PRELOAD_LOADER,
-  ABOUT_TEXTURES,
-  IMAGE_ASSETS,
-  filterTexturesByDevice
-} from './config/texturePreloadList';
-import { TextureLoader } from 'three';
-
-// Standard Browser-level Image Preloader (for <img> tags)
-const preloadBrowserImage = (path) => {
-  if (typeof window === 'undefined') return;
-  const img = new Image();
-  img.src = path;
-};
-
-const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
-const isWeakCPU = typeof navigator.hardwareConcurrency !== 'undefined' && navigator.hardwareConcurrency <= 4;
-const isLowRAM = typeof navigator.deviceMemory !== 'undefined' && navigator.deviceMemory <= 4;
-const isSmallScreen = typeof window !== 'undefined' && window.innerWidth < 450;
-const isLowEnd = isMobileDevice || isWeakCPU || isLowRAM || isSmallScreen;
-
-// Refined check for "hover capability" (non-touch devices should have hover: hover)
-// Laptops with touch screens (which also have a mouse/trackpad) will return true here.
-const supportsHover = typeof window !== 'undefined' && window.matchMedia('(hover: hover)').matches;
-
-// Trigger Three.js preloads at module level (as standard for Drei)
-if (isLowEnd) {
-  const CORE_TEXTURES = [...ENTRANCE_TEXTURES, ...CORRIDOR_TEXTURES, ...UI_TEXTURES, ...IMAGE_ASSETS];
-  const filteredCore = filterTexturesByDevice(CORE_TEXTURES, supportsHover);
-  const filteredAbout = filterTexturesByDevice(ABOUT_TEXTURES, supportsHover);
-
-  filteredCore.forEach(path => useTexture.preload(path));
-  filteredAbout.forEach(path => useLoader.preload(TextureLoader, path));
-} else {
-  const filteredAll = filterTexturesByDevice(PRELOAD_ALL, supportsHover);
-  const filteredLoader = filterTexturesByDevice(PRELOAD_LOADER, supportsHover);
-  
-  filteredAll.forEach(path => useTexture.preload(path));
-  filteredLoader.forEach(path => useLoader.preload(TextureLoader, path));
-}
-
-const FONT_URL = 'https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff';
-
-// Helper component to handle global audio enable on interaction
-const GlobalAudioEnabler = () => {
-  const { enableAudio } = useAudio();
-  useEffect(() => {
-    const handleInteraction = () => enableAudio();
-    window.addEventListener('click', handleInteraction, { once: true });
-    window.addEventListener('touchstart', handleInteraction, { once: true });
-    window.addEventListener('keydown', handleInteraction, { once: true });
-    return () => {
-      window.removeEventListener('click', handleInteraction);
-      window.removeEventListener('touchstart', handleInteraction);
-      window.removeEventListener('keydown', handleInteraction);
-    };
-  }, [enableAudio]);
-  return null;
-};
-
-// Scene background using corridor wall texture (static, no animation)
-const PaperSceneBackground = () => {
-  const { scene } = useThree();
-  const texture = useTexture('/textures/paper-texture.webp');
-
-  useEffect(() => {
-    texture.colorSpace = THREE.SRGBColorSpace;
-    scene.background = texture;
-
-    return () => {
-      scene.background = null;
-    };
-  }, [scene, texture]);
-
-  return null;
-};
-
-// Bridge component to use hooks inside SceneProvider
-// Handles dynamic meta tags + deep link auto-teleport
-function DocumentMetaBridge() {
-  useDocumentMeta();
-
-  const { initialRoom, deeplinkHandled, hasEntered, teleportTo, markEntered } = useScene();
-
-  // Deep linking: if user lands on e.g. /gallery, auto-teleport after scene loads
-  useEffect(() => {
-    if (initialRoom && hasEntered && !deeplinkHandled.current) {
-      deeplinkHandled.current = true;
-      // Small delay to let the corridor render first
-      setTimeout(() => teleportTo(initialRoom), 300);
-    }
-  }, [initialRoom, hasEntered, teleportTo, deeplinkHandled]);
-
-  return null;
-}
-
-function AppContent() {
-  const [isLoaded, setIsLoaded] = useState(false);
-  const [sceneReady, setSceneReady] = useState(false);
-
-  // Use Performance Context
-  const { settings, downgradeTier, tier } = usePerformance();
-
-  // Force initialize audio in the background on mount
-  useEffect(() => {
-    initAudio();
-  }, []);
-
-  const handleSceneReady = useCallback(() => {
-    requestAnimationFrame(() => {
-      setSceneReady(true);
-    });
-  }, []);
-
-  return (
-    <AudioProvider>
-      <SceneProvider>
-        <DocumentMetaBridge />
-        <GlobalAudioEnabler />
-        <div className="app">
-          {/* Full screen 3D Canvas */}
-          <div className="canvas-wrapper">
-            <Canvas
-              camera={{
-                position: [0, 0.2, 28],
-                fov: 60,
-                near: 0.1,
-                far: 150
-              }}
-              gl={{
-                antialias: settings.antialias,
-                alpha: false,
-                powerPreference: settings.powerPreference,
-                localClippingEnabled: true,
-                failIfMajorPerformanceCaveat: true
-              }}
-              dpr={settings.dpr}
-              shadows={settings.shadows}
-            >
-              <color attach="background" args={['#fafafa']} />
-              <fog attach="fog" args={['#fafafa', 15, 50]} />
-
-              {/* Scale performance down if fps drops */}
-              <PerformanceMonitor
-                onDecline={() => downgradeTier()}
-                flipflops={3}
-                onFallback={() => downgradeTier()}
-              />
-
-              {/* Advanced FPS & Performance Monitor */}
-              {/* <Perf position="top-left" minimal={false} /> */}
-
-              <Suspense fallback={null}>
-                <Experience
-                  isLoaded={isLoaded}
-                  onSceneReady={handleSceneReady}
-                  performanceTier={tier}
-                />
-                <Preload all />
-              </Suspense>
-            </Canvas>
-          </div>
-
-          {/* Navigation UI - Hamburger, Map, Back, Audio */}
-          {isLoaded && (
-            <>
-              <NavigationUI />
-              <ClassroomTaskOverlay />
-              <GlobalOverlay />
-              <PaperTransition />
-              <ScreenReaderOverlay />
-            </>
-          )}
-
-          {/* 2D Preloader */}
-          <Preloader
-            ready={sceneReady}
-            onComplete={() => setIsLoaded(true)}
-          />
-        </div>
-      </SceneProvider>
-    </AudioProvider>
-  );
-}
+import './styles/shopping.scss';
 
 export default function App() {
-  // Preload browser-based images (for standard <img> tags) immediately upon mounting App
-  // This ensures they are in the network waterfall during the initial loading phase.
-  useEffect(() => {
-    // Eagerly preload Sanity CMS data and images
-    loadSanityData();
+  // Navigation & Search State
+  const [searchTerm, setSearchTerm] = useState('');
+  
+  // Modals & Drawers State
+  const [cartOpen, setCartOpen] = useState(false);
+  const [wishlistOpen, setWishlistOpen] = useState(false);
+  const [graphicsModalOpen, setGraphicsModalOpen] = useState(false);
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [inspectProductId, setInspectProductId] = useState(null);
 
-    const filteredImages = filterTexturesByDevice(IMAGE_ASSETS, supportsHover);
-    // console.log(`[Preload] Triggering browser-level image preloads for ${filteredImages.length} assets.`);
-    filteredImages.forEach(path => preloadBrowserImage(path));
-  }, []);
+  // Graphics Settings
+  const [graphicsSettings, setGraphicsSettings] = useState({
+    preset: 'ultra',
+    particles: 2000,
+    bloom: true,
+    shadows: true,
+    wireframe: false,
+    soundEnabled: true,
+  });
+
+  // Cart State (stored in localStorage)
+  const [cartItems, setCartItems] = useState(() => {
+    try {
+      const saved = localStorage.getItem('cybershop_cart');
+      return saved ? JSON.parse(saved) : [
+        {
+          id: 1,
+          title: 'Samsung galaxy s7 edge',
+          price: 5000,
+          quantity: 1,
+          image: 'product07.png',
+          categoryName: 'Electronics',
+          brandName: 'Samsung',
+        },
+        {
+          id: 4,
+          title: 'iPhone 6s',
+          price: 32000,
+          quantity: 1,
+          image: 'http___pluspng.com_img-png_iphone-6s-png-iphone-6s-gold-64gb-1000.png',
+          categoryName: 'Electronics',
+          brandName: 'Apple',
+        }
+      ];
+    } catch {
+      return [];
+    }
+  });
+
+  // Wishlist State (stored in localStorage)
+  const [wishlistIds, setWishlistIds] = useState(() => {
+    try {
+      const saved = localStorage.getItem('cybershop_wishlist');
+      return saved ? JSON.parse(saved) : [3, 7, 10];
+    } catch {
+      return [3, 7, 10];
+    }
+  });
+
+  // References for smooth scrolling
+  const heroRef = useRef(null);
+  const catalogRef = useRef(null);
+  const dealsRef = useRef(null);
+
+  // Sync to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('cybershop_cart', JSON.stringify(cartItems));
+    } catch (e) {
+      console.warn('Could not save cart:', e);
+    }
+  }, [cartItems]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('cybershop_wishlist', JSON.stringify(wishlistIds));
+    } catch (e) {
+      console.warn('Could not save wishlist:', e);
+    }
+  }, [wishlistIds]);
+
+  // Cart Handlers
+  const handleAddToCart = (product, quantity = 1) => {
+    setCartItems((prev) => {
+      const existing = prev.find((item) => item.id === product.id);
+      if (existing) {
+        return prev.map((item) =>
+          item.id === product.id
+            ? { ...item, quantity: item.quantity + quantity }
+            : item
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: product.id,
+          title: product.title,
+          price: product.price,
+          quantity,
+          image: product.image,
+          categoryName: product.categoryName,
+          brandName: product.brandName,
+        },
+      ];
+    });
+  };
+
+  const handleUpdateCartQty = (id, newQty) => {
+    setCartItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, quantity: newQty } : item))
+    );
+  };
+
+  const handleRemoveFromCart = (id) => {
+    setCartItems((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  // Wishlist Handlers
+  const handleToggleWishlist = (id) => {
+    setWishlistIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  // 3D Inspector Handlers
+  const inspectedProduct = productsData.products.find(
+    (p) => p.id === inspectProductId
+  );
+
+  const handleOpenInspect = (id) => {
+    setInspectProductId(id);
+  };
+
+  const handleCloseInspect = () => {
+    setInspectProductId(null);
+  };
+
+  const handleBuyNow = (product, quantity) => {
+    handleAddToCart(product, quantity);
+    setInspectProductId(null);
+    setCartOpen(false);
+    setCheckoutOpen(true);
+  };
+
+  // Checkout Handlers
+  const handleProceedToCheckout = () => {
+    setCartOpen(false);
+    setCheckoutOpen(true);
+  };
+
+  const handleOrderCompleted = () => {
+    setCartItems([]);
+  };
+
+  // Nav scroll handler
+  const handleNavClick = (section) => {
+    sounds.playClick();
+    if (section === 'hero' && heroRef.current) {
+      heroRef.current.scrollIntoView({ behavior: 'smooth' });
+    } else if (section === 'catalog' && catalogRef.current) {
+      catalogRef.current.scrollIntoView({ behavior: 'smooth' });
+    } else if (section === 'deals' && dealsRef.current) {
+      dealsRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  };
+
+  const totalCartCount = cartItems.reduce((acc, i) => acc + i.quantity, 0);
 
   return (
-    <PerformanceProvider>
-      <AchievementsProvider>
-        <AppContent />
-      </AchievementsProvider>
-    </PerformanceProvider>
+    <div className="cyberstore-app">
+      {/* Sticky Navigation Bar */}
+      <Navbar
+        searchTerm={searchTerm}
+        onSearchChange={setSearchTerm}
+        cartCount={totalCartCount}
+        wishlistCount={wishlistIds.length}
+        onOpenCart={() => setCartOpen(true)}
+        onOpenWishlist={() => setWishlistOpen(true)}
+        onOpenGraphicsModal={() => setGraphicsModalOpen(true)}
+        soundEnabled={graphicsSettings.soundEnabled}
+        onToggleSound={() =>
+          setGraphicsSettings((s) => ({ ...s, soundEnabled: !s.soundEnabled }))
+        }
+        onNavClick={handleNavClick}
+      />
+
+      {/* Hero 3D Section */}
+      <div ref={heroRef}>
+        <Hero3D
+          onExploreCatalog={() => handleNavClick('catalog')}
+          onOpenProductInspect={handleOpenInspect}
+        />
+      </div>
+
+      {/* Product Catalog & Hot Deals */}
+      <ProductCatalog
+        productsData={productsData}
+        searchTerm={searchTerm}
+        onOpenInspect={handleOpenInspect}
+        onAddToCart={handleAddToCart}
+        wishlistIds={wishlistIds}
+        onToggleWishlist={handleToggleWishlist}
+        catalogRef={catalogRef}
+        dealsRef={dealsRef}
+      />
+
+      {/* 3D Product Inspector Modal */}
+      {inspectedProduct && (
+        <ProductInspectorModal3D
+          product={inspectedProduct}
+          onClose={handleCloseInspect}
+          onAddToCart={handleAddToCart}
+          onBuyNow={handleBuyNow}
+        />
+      )}
+
+      {/* Cart Drawer */}
+      <CartDrawer
+        isOpen={cartOpen}
+        onClose={() => setCartOpen(false)}
+        cartItems={cartItems}
+        onUpdateQty={handleUpdateCartQty}
+        onRemoveItem={handleRemoveFromCart}
+        onProceedToCheckout={handleProceedToCheckout}
+      />
+
+      {/* Wishlist Drawer */}
+      <WishlistDrawer
+        isOpen={wishlistOpen}
+        onClose={() => setWishlistOpen(false)}
+        wishlistIds={wishlistIds}
+        products={productsData.products}
+        onAddToCart={handleAddToCart}
+        onRemoveFromWishlist={handleToggleWishlist}
+        onOpenInspect={handleOpenInspect}
+      />
+
+      {/* Checkout Modal */}
+      <CheckoutModal
+        isOpen={checkoutOpen}
+        onClose={() => setCheckoutOpen(false)}
+        cartItems={cartItems}
+        totalAmount={cartItems.reduce(
+          (acc, item) => acc + item.price * item.quantity,
+          0
+        )}
+        onOrderCompleted={handleOrderCompleted}
+      />
+
+      {/* Graphics & Performance Settings Modal */}
+      <GraphicsSettingsModal
+        isOpen={graphicsModalOpen}
+        onClose={() => setGraphicsModalOpen(false)}
+        settings={graphicsSettings}
+        onUpdateSettings={(newSettings) =>
+          setGraphicsSettings((prev) => ({ ...prev, ...newSettings }))
+        }
+      />
+
+      {/* Site Footer */}
+      <Footer
+        onCategoryClick={(cid) => {
+          handleNavClick('catalog');
+        }}
+      />
+    </div>
   );
 }
